@@ -1,8 +1,14 @@
-using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using System.Text.RegularExpressions;
 
 using Serilog;
 using Serilog.Extensions.Logging;
 
+using Service;
+
+const string healthCheckPath = "/healthz";
+const string requestWarningPatternConfigKey = "requestWarningPattern";
+
+AppDomain.CurrentDomain.SetData("REGEX_DEFAULT_MATCH_TIMEOUT", TimeSpan.FromSeconds(2));
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
 builder.Host.UseSerilog(ConfigureLogger);
@@ -13,9 +19,8 @@ builder.Services.AddHealthChecks();
 
 WebApplication app = builder.Build();
 
-app.UseSerilogRequestLogging();
-app.UseWhen(IsHealthCheck, UseHealthCheckMiddleware);
-app.UseWhen(IsNotHealthCheck, UseMyMiddleware);
+app.UseHealthChecks(healthCheckPath);
+app.UseWhen(IsNotHealthCheck, UseMyMiddleware(builder.Configuration));
 
 app.Run();
 
@@ -27,54 +32,40 @@ static void ConfigureLogger(HostBuilderContext context, IServiceProvider service
         .ReadFrom.Services(serviceProvider);
 }
 
-static void UseMyMiddleware(IApplicationBuilder applicationBuilder)
+static Action<IApplicationBuilder> UseMyMiddleware(IConfiguration configuration)
 {
-    applicationBuilder.Use(MyMiddleware);
-}
-
-static void UseHealthCheckMiddleware(IApplicationBuilder applicationBuilder)
-{
-    applicationBuilder.UseMiddleware<HealthCheckMiddleware>();
+    string warningPattern = configuration[requestWarningPatternConfigKey] ?? "";
+    
+    return applicationBuilder => applicationBuilder.Use(MyMiddlewareFactory(warningPattern));
 }
 
 static bool IsNotHealthCheck(HttpContext context)
 {
-    return !IsHealthCheck(context);
+    return context.Request.Path.Value?.StartsWith(healthCheckPath) != true;
 }
 
-static bool IsHealthCheck(HttpContext context)
+static Func<HttpContext, RequestDelegate, Task> MyMiddlewareFactory(string warningPattern)
 {
-    return context.Request.Path.Value?.StartsWith("/healthz") == true;
-}
+    var regex = new Regex(warningPattern);
+    
+    return MyMiddleware;
 
-static Task MyMiddleware(HttpContext context, RequestDelegate requestDelegate)
-{
-    (Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == Environments.Development).IfTrue(LogHeaders);
-
-    return Task.CompletedTask;
-
-    void LogHeaders()
+    Task MyMiddleware(HttpContext context, RequestDelegate requestDelegate)
     {
         ILogger<Program> logger = new SerilogLoggerFactory(Log.Logger).CreateLogger<Program>();
-        IDictionary<string, string> headers = context.Request.Headers.ToDictionary(pair => pair.Key, pair => pair.Value.ToString());
 
-        logger.Headers(headers);
-    }
-}
+        regex.IsMatch(context.Request.Headers["X-Original-URI"].ToString()).Match(Warn, Info);
 
-internal static class BooleanExtensions
-{
-    internal static void IfTrue(this bool value, Action action)
-    {
-        if (value)
+        return Task.CompletedTask;
+
+        void Warn()
         {
-            action();
+            logger.RequestWarn();
+        }
+
+        void Info()
+        {
+            logger.RequestInfo();
         }
     }
-}
-
-internal static partial class LogMessages
-{
-    [LoggerMessage(LogLevel.Debug, "Headers {Headers}")]
-    internal static partial void Headers(this ILogger<Program> logger, IDictionary<string, string> headers);
 }
